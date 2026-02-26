@@ -37,9 +37,11 @@ architecture rtl of denise is
   -- 10.9 μs (17.2%) out of every 63.6 μs scan line. In PAL, it
   -- occupies 12 μs (18.8%) out of every 64 μs scan line.
   -- NTSC: main clock 28.63636 MHz
-  -- PAL:  main clock 28.37516 MHz, hblank is 85.12548 clk (7 MHz)
-  constant HBLANK_START_PAL : natural range 0 to 511 := 3;
-  constant HBLANK_NCLK_PAL  : natural range 0 to 511 := 85;
+  -- PAL:  main clock 28.37516 MHz
+  -- For PAL we align hblank with the Minimig/Denise reference:
+  -- HPOS $13 (start) to $61 (end).
+  constant HBLANK_START_PAL : natural range 0 to 511 := 16#013#;
+  constant HBLANK_NCLK_PAL  : natural range 0 to 511 := 16#061#;
   constant NBURST_START_PAL : natural range 0 to 511 := 41;
   constant NBURST_NCLK_PAL  : natural range 0 to 511 := 18;
 
@@ -85,11 +87,21 @@ architecture rtl of denise is
   end record;
 
   type state_c is record
-    -- horizontal video beam position, lores
+    -- horizontal video beam position, lores (HPOS in 7 MHz clocks)
     h         : unsigned(8 downto 0);
+    -- long-line enable flag (one extra 7 MHz cycle after STRLONG)
+    lol_ena   : std_ulogic;
     hblank    : std_ulogic;
     vblank    : std_ulogic;
-    -- Indicates that beam is currently in the horizontal display window.
+    -- raw horizontal display window (DIWSTRT/DIWSTOP)
+    hwin0     : std_ulogic;
+    -- hwin0 AND per-line vertical window
+    hwin1     : std_ulogic;
+    -- delayed window used for pixel pipeline alignment
+    hwin2     : std_ulogic;
+    -- per-line vertical window (set by BPL1DAT writes)
+    vwin      : std_ulogic;
+    -- combined display window flag used for masking/gating
     diw       : std_ulogic;
     diwstrth  : std_ulogic_vector(8 downto 0);
     diwstoph  : std_ulogic_vector(8 downto 0);
@@ -154,16 +166,25 @@ architecture rtl of denise is
     drd_ext_noe       : std_ulogic;
     drd_ext_to_denice : std_ulogic;
   end record;
+
   function STATE_SIMINIT return state_t is
     variable v : state_t;
   begin
-    v.c.h := (others => '0');
-    v.c.bplcon.pf1h := (others => '0');
-    v.c.bplcon.pf2h := (others => '0');
-    v.c.bplcon.pf1p := (others => '0');
-    v.c.bplcon.pf2p := (others => '0');
-    v.f.pfp := (others => (others => '0'));
-    v.f.spp := (others => '0');
+    v.c.h                    := (others => '0');
+    v.c.lol_ena              := '0';
+    v.c.hblank               := '0';
+    v.c.vblank               := '0';
+    v.c.hwin0                := '0';
+    v.c.hwin1                := '0';
+    v.c.hwin2                := '0';
+    v.c.vwin                 := '0';
+    v.c.diw                  := '0';
+    v.c.bplcon.pf1h          := (others => '0');
+    v.c.bplcon.pf2h          := (others => '0');
+    v.c.bplcon.pf1p          := (others => '0');
+    v.c.bplcon.pf2p          := (others => '0');
+    v.f.pfp                  := (others => (others => '0'));
+    v.f.spp                  := (others => '0');
     return v;
   end;
 
@@ -264,21 +285,69 @@ begin
     v.b.colori := r.a.rga(5 downto 1);
 
 
-    -- Advance beam counter every clk7 cycle.
-    v.c.h := r.c.h + 1;
-    -- Horizontal counter is reset when Agnus writes a sync strobe.
-    if r.b.sel.strhor = '1' or r.b.sel.strvbl = '1' or r.b.sel.strequ = '1' then
-      v.c.h := "111111110";
+    --------------------------------------------------------------------
+    -- Horizontal beam counter (HPOS) with STRLONG long-line support. --
+    --------------------------------------------------------------------
+    -- Default: keep previous values.
+    v.c.h       := r.c.h;
+    v.c.lol_ena := r.c.lol_ena;
+
+    -- Reset HPOS at line start when Agnus writes STRHOR, STRVBL or STREQU.
+    if r.b.sel.strhor = '1' or
+       r.b.sel.strvbl = '1' or
+       r.b.sel.strequ = '1'
+    then
+      -- Real Denise starts lines at HPOS=2.
+      v.c.h       := to_unsigned(2, v.c.h'length);
+      v.c.lol_ena := '0';
+      -- reset horizontal window pipeline at line start
+      v.c.hwin0   := '0';
+      v.c.hwin1   := '0';
+      v.c.hwin2   := '0';
+    else
+      -- Long line: one extra 7 MHz cycle without increment.
+      if r.b.sel.strlong = '1' then
+        v.c.lol_ena := '1';
+      elsif r.c.lol_ena = '1' then
+        -- Consume the long-line cycle: hold HPOS, clear flag.
+        v.c.lol_ena := '0';
+      else
+        -- Normal increment.
+        v.c.h := r.c.h + 1;
+      end if;
     end if;
 
-    -- Match display window horizontal start and stop position.
+    --------------------------------------------------------------------
+    -- Per-line vertical "window" (used with DIW to emulate Denise).  --
+    --------------------------------------------------------------------
+    -- Clear vertical window early in the line (HPOS ≈ $13).
+    if r.c.h = to_unsigned(16#013#, r.c.h'length) then
+      v.c.vwin := '0';
+    end if;
+    -- Set vertical window when BPL1DAT is written.
+    if r.b.sel.bpldat(0) = '1' then
+      v.c.vwin := '1';
+    end if;
+
+    --------------------------------------------------
+    -- Display window start/stop and DIW generation --
+    --------------------------------------------------
+    -- Raw horizontal window based on DIWSTRT/DIWSTOP.
     if std_ulogic_vector(r.c.h) = r.c.diwstrth then
-      v.c.diw := '1';
+      v.c.hwin0 := '1';
     end if;
     if std_ulogic_vector(r.c.h) = r.c.diwstoph then
-      v.c.diw := '0';
+      v.c.hwin0 := '0';
     end if;
 
+    -- Horizontal window AND vertical window, then one-cycle pipeline.
+    v.c.hwin1 := r.c.hwin0 and r.c.vwin;
+    v.c.hwin2 := r.c.hwin1;
+    v.c.diw   := v.c.hwin2;
+
+    -------------------------
+    -- Blanking generation --
+    -------------------------
     if r.c.h = to_unsigned(HBLANK_START_PAL, r.c.h'length) then
       v.c.hblank := '1';
     end if;
@@ -469,6 +538,10 @@ begin
           r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h and "1110"))+i)
         );
         v.e.bplbus(1-i)(5) := '0';
+        -- mask hires pixels outside combined display window
+        if r.c.diw = '0' then
+          v.e.bplbus(1-i) := (others => '0');
+        end if;
       else
         v.e.bplbus(i)(0) := (
           r.d.bplen(0) and
@@ -494,6 +567,10 @@ begin
           r.d.bplen(5) and
           r.d.shreg.bpld(5)(to_integer(unsigned(r.c.bplcon.pf2h)))
         );
+        -- mask lores pixels outside combined display window
+        if r.c.diw = '0' then
+          v.e.bplbus(i) := (others => '0');
+        end if;
       end if;
     end loop;
 
@@ -526,6 +603,12 @@ begin
         end if;
       end if;
     end loop;
+
+    -- NOTE: Do NOT kill sprites outside DIW. Real Amiga Denise displays
+    -- sprites in the border region (e.g. mouse pointer, status bar sprites,
+    -- demo effects). The amiga_replacement_project confirms sprites are
+    -- independent of the display window. Bitplane pixels are already
+    -- correctly masked to zero outside DIW in the bplbus generation above.
 
 
     -- Display priority control: select between playfields 1, 2.
@@ -617,9 +700,17 @@ begin
         end if;
       end if;
 
-      -- Color 0 to left and right of display window.
+      -- Outside the display window: show border color (COLOR00) for
+      -- playfield pixels, but keep sprite colors visible. In real Amiga
+      -- Denise, sprites are drawn independently of the display window.
+      -- Sprite color indices have bit 4 set (registers 16-31), while
+      -- playfield color indices have bit 4 clear (registers 0-15).
+      -- Reference: amiga_replacement_project/denise masks only the
+      -- bitplane pixel bus with the display window, not sprites.
       if r.c.diw = '0' then
-        v.g.color(i) := (others => '0');
+        if v.g.color(i)(4) = '0' then
+          v.g.color(i) := (others => '0');
+        end if;
       end if;
     end loop;
     v.g.hamop := r.f.hamop;
@@ -767,4 +858,3 @@ begin
   end block;
 
 end;
-
