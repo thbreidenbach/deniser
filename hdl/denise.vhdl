@@ -24,7 +24,8 @@ use work.priv.all;
 entity denise is
   generic (
     CFG_STRDEBUG            : boolean := false;
-    CFG_BLANK_DURING_VBLANK : boolean := true
+    CFG_BLANK_DURING_VBLANK : boolean := true;
+    CFG_ECS                 : boolean := false
   );
   port (
     deni  : in    denise_in_t;
@@ -79,11 +80,14 @@ architecture rtl of denise is
     dblpf     : std_ulogic;
     color     : std_ulogic;
     gaud      : std_ulogic;
+    shres     : std_ulogic;     -- BPLCON0 bit 6 (ECS: super-hires)
+    brdrblnk  : std_ulogic;     -- BPLCON0 bit 5 (ECS: blank borders)
     pf1h      : std_ulogic_vector(3 downto 0);
     pf2h      : std_ulogic_vector(3 downto 0);
     pf1p      : std_ulogic_vector(2 downto 0);
     pf2p      : std_ulogic_vector(2 downto 0);
     pf2pri    : std_ulogic;
+    killehb   : std_ulogic;     -- BPLCON2 bit 9 (ECS: disable EHB)
   end record;
 
   type state_c is record
@@ -123,32 +127,45 @@ architecture rtl of denise is
    of std_ulogic_vector(5 downto 0);
 
   type state_e is record
-    bplbus    : bplbus_array_t(0 to 1);
+    -- 4 pixel slots: lores uses 0..1 (same), hires 0..1, SHRES 0..3
+    bplbus    : bplbus_array_t(0 to 3);
     -- 8 sprites * 2 lines
     sprbus    : std_ulogic_vector(15 downto 0);
+    -- pipelined blanking signals
+    hblank    : std_ulogic;
+    vblank    : std_ulogic;
+    diw       : std_ulogic;
   end record;
 
   type pfp_array_t is array (integer range <>) of std_ulogic_vector(2 downto 0);
 
   type state_f is record
-    bplcolor  : color_index_array_t(0 to 1);
+    bplcolor  : color_index_array_t(0 to 3);
     hamop     : std_ulogic_vector(1 downto 0);
     sprcolor  : std_ulogic_vector(3 downto 0);
     -- playfield X priority code (with respect to sprites)
-    pfp       : pfp_array_t(0 to 1);
+    pfp       : pfp_array_t(0 to 3);
     -- sprite group number
     spp       : std_ulogic_vector(2 downto 0);
+    -- pipelined blanking signals
+    hblank    : std_ulogic;
+    vblank    : std_ulogic;
+    diw       : std_ulogic;
   end record;
 
   type state_g is record
-    color     : color_index_array_t(0 to 1);
+    color     : color_index_array_t(0 to 3);
     issprite  : std_ulogic;
     hamop     : std_ulogic_vector(1 downto 0);
+    -- pipelined blanking signals
+    hblank    : std_ulogic;
+    vblank    : std_ulogic;
+    diw       : std_ulogic;
   end record;
 
   type state_h is record
-    rgb       : rgb4_array_t(0 to 1);
-    nzd       : std_ulogic_vector(0 to 1);
+    rgb       : rgb4_array_t(0 to 3);
+    nzd       : std_ulogic_vector(0 to 3);
   end record;
 
   type state_t is record
@@ -179,10 +196,13 @@ architecture rtl of denise is
     v.c.hwin2                := '0';
     v.c.vwin                 := '0';
     v.c.diw                  := '0';
+    v.c.bplcon.shres         := '0';
+    v.c.bplcon.brdrblnk      := '0';
     v.c.bplcon.pf1h          := (others => '0');
     v.c.bplcon.pf2h          := (others => '0');
     v.c.bplcon.pf1p          := (others => '0');
     v.c.bplcon.pf2p          := (others => '0');
+    v.c.bplcon.killehb       := '0';
     v.f.pfp                  := (others => (others => '0'));
     v.f.spp                  := (others => '0');
     return v;
@@ -259,7 +279,8 @@ begin
     if
       r.a.sel.joy0dat = '1' or
       r.a.sel.joy1dat = '1' or
-      r.a.sel.clxdat  = '1'
+      r.a.sel.clxdat  = '1' or
+      (r.a.sel.deniseid = '1' and CFG_ECS)
     then
       v.drd_oe := '1';
       v.drd_ext_noe := '0';
@@ -274,6 +295,11 @@ begin
     end if;
     if r.a.sel.clxdat = '1' then
       v.drd(r.c.clxdat'range) := r.c.clxdat;
+    end if;
+    -- ECS Denise identification register ($07C).
+    -- Real ECS Denise returns $00FC. OCS does not respond.
+    if r.a.sel.deniseid = '1' and CFG_ECS then
+      v.drd := x"00FC";
     end if;
 
     -- register address decoder
@@ -292,10 +318,11 @@ begin
     v.c.h       := r.c.h;
     v.c.lol_ena := r.c.lol_ena;
 
-    -- Reset HPOS at line start when Agnus writes STRHOR, STRVBL or STREQU.
+    -- Reset HPOS at line start when Agnus writes STRHOR, STRVBL, or
+    -- STREQU (ECS only — OCS Denise ignores STREQU for HPOS reset).
     if r.b.sel.strhor = '1' or
        r.b.sel.strvbl = '1' or
-       r.b.sel.strequ = '1'
+       (r.b.sel.strequ = '1' and CFG_ECS)
     then
       -- Real Denise starts lines at HPOS=2.
       v.c.h       := to_unsigned(2, v.c.h'length);
@@ -321,7 +348,9 @@ begin
     -- Per-line vertical "window" (used with DIW to emulate Denise).  --
     --------------------------------------------------------------------
     -- Clear vertical window early in the line (HPOS ≈ $13).
-    if r.c.h = to_unsigned(16#013#, r.c.h'length) then
+    -- Use v.c.h (post-increment) to match amiga_replacement timing
+    -- where comparisons happen on cdac_f AFTER cdac_r increments HPOS.
+    if v.c.h = to_unsigned(16#013#, v.c.h'length) then
       v.c.vwin := '0';
     end if;
     -- Set vertical window when BPL1DAT is written.
@@ -333,10 +362,11 @@ begin
     -- Display window start/stop and DIW generation --
     --------------------------------------------------
     -- Raw horizontal window based on DIWSTRT/DIWSTOP.
-    if std_ulogic_vector(r.c.h) = r.c.diwstrth then
+    -- Use v.c.h (post-increment) to match amiga_replacement timing.
+    if std_ulogic_vector(v.c.h) = r.c.diwstrth then
       v.c.hwin0 := '1';
     end if;
-    if std_ulogic_vector(r.c.h) = r.c.diwstoph then
+    if std_ulogic_vector(v.c.h) = r.c.diwstoph then
       v.c.hwin0 := '0';
     end if;
 
@@ -348,10 +378,11 @@ begin
     -------------------------
     -- Blanking generation --
     -------------------------
-    if r.c.h = to_unsigned(HBLANK_START_PAL, r.c.h'length) then
+    -- Use v.c.h (post-increment) to match amiga_replacement timing.
+    if v.c.h = to_unsigned(HBLANK_START_PAL, v.c.h'length) then
       v.c.hblank := '1';
     end if;
-    if r.c.h = to_unsigned(HBLANK_NCLK_PAL, r.c.h'length) then
+    if v.c.h = to_unsigned(HBLANK_NCLK_PAL, v.c.h'length) then
       v.c.hblank := '0';
     end if;
     if r.b.sel.strvbl = '1' or r.b.sel.strequ = '1' then
@@ -365,11 +396,11 @@ begin
     -- NOTE: The width of these comparators can likely be reduced.
     if
       r.c.bplcon.color = '1' and
-      r.c.h = to_unsigned(HBLANK_START_PAL, r.c.h'length)
+      v.c.h = to_unsigned(HBLANK_START_PAL, v.c.h'length)
     then
       v.nburst := '0';
     elsif
-      r.c.h = to_unsigned(NBURST_START_PAL+NBURST_NCLK_PAL, r.c.h'length)
+      v.c.h = to_unsigned(NBURST_START_PAL+NBURST_NCLK_PAL, v.c.h'length)
     then
       v.nburst := '1';
     end if;
@@ -381,6 +412,11 @@ begin
     end if;
     if r.b.sel.diwstop = '1' then
       v.c.diwstoph := '1' & r.b.drdx(7 downto 0);
+    end if;
+    -- ECS DIWHIGH register: override H8 bits of DIWSTRT/DIWSTOP.
+    if r.b.sel.diwhigh = '1' and CFG_ECS then
+      v.c.diwstrth(8) := r.b.drdx(5);
+      v.c.diwstoph(8) := r.b.drdx(13);
     end if;
 
     -- write color table register
@@ -433,6 +469,10 @@ begin
       v.c.bplcon.dblpf  := r.b.drdx(10);
       v.c.bplcon.color  := r.b.drdx( 9);
       v.c.bplcon.gaud   := r.b.drdx( 8);
+      if CFG_ECS then
+        v.c.bplcon.shres    := r.b.drdx(6);
+        v.c.bplcon.brdrblnk := r.b.drdx(5);
+      end if;
     end if;
     if r.b.sel.bplcon1 = '1' then
       v.c.bplcon.pf2h   := r.b.drdx( 7 downto  4);
@@ -442,6 +482,9 @@ begin
       v.c.bplcon.pf2pri := r.b.drdx( 6);
       v.c.bplcon.pf2p   := r.b.drdx( 5 downto  3);
       v.c.bplcon.pf1p   := r.b.drdx( 2 downto  0);
+      if CFG_ECS then
+        v.c.bplcon.killehb := r.b.drdx(9);
+      end if;
     end if;
 
     if r.b.sel.clxcon = '1' then
@@ -456,6 +499,25 @@ begin
     if r.a.sel.clxdat = '1' then
       v.c.clxdat := (others => '0');
     end if;
+
+
+    -- Pipeline blanking/DIW signals alongside pixel data (stages E→F→G).
+    -- Pixel data enters the pipeline at stage E (v.e.bplbus from r.d).
+    -- HBLANK/VBLANK from stage C (r.c.hblank) also enter at stage E so
+    -- they travel the same number of stages to the output (stage H).
+    -- At cycle N+1: r.c.hblank reflects comparison from cycle N,
+    --               v.e.bplbus uses r.d from cycle N (same source cycle).
+    -- This matches amiga_replacement where cblank_p4 and pf_data_p4
+    -- are at the same pipeline stage.
+    v.e.hblank := r.c.hblank;
+    v.e.vblank := r.c.vblank;
+    v.e.diw    := r.c.diw;
+    v.f.hblank := r.e.hblank;
+    v.f.vblank := r.e.vblank;
+    v.f.diw    := r.e.diw;
+    v.g.hblank := r.f.hblank;
+    v.g.vblank := r.f.vblank;
+    v.g.diw    := r.f.diw;
 
 
     -- parallel to serial converters
@@ -486,7 +548,21 @@ begin
       end if;
     end loop;
 
-    if r.c.bplcon.hires = '1' then
+    if r.c.bplcon.shres = '1' and CFG_ECS then
+      -- SHRES: shift 4 bits per CLK7 cycle (4 pixels at 35 ns each).
+      -- Only bitplanes 0-3 are used in super-hires mode.
+      for i in 0 to 3 loop
+        v.d.shreg.bpld(i) := (
+          r.d.shreg.bpld(i)(15-4 downto 0) &
+          r.d.shreg.bpl (i)(15 downto 12)
+        );
+        if r.c.bpltrig = '1' then
+          v.d.shreg.bpl(i) := r.c.bpldat(i);
+        else
+          v.d.shreg.bpl(i) := r.d.shreg.bpl (i)(15-4 downto 0) & "0000";
+        end if;
+      end loop;
+    elsif r.c.bplcon.hires = '1' then
       for i in 0 to 3 loop
         v.d.shreg.bpld(i) := (
           r.d.shreg.bpld(i)(15-2 downto 0) &
@@ -506,9 +582,11 @@ begin
        r.d.shreg.spr(i).a(r.d.shreg.spr(i).a'high - 1 downto 0) & '0';
       v.d.shreg.spr(i).b :=
        r.d.shreg.spr(i).b(r.d.shreg.spr(i).b'high - 1 downto 0) & '0';
+      -- Use v.c.h (post-increment) to match amiga_replacement timing
+      -- where sprite HPOS match happens on cdac_f AFTER cdac_r increment.
       if
         (r.c.spr(i).en = '1') and
-        (std_ulogic_vector(r.c.h) = r.c.spr(i).sh)
+        (std_ulogic_vector(v.c.h) = r.c.spr(i).sh)
       then
         v.d.shreg.spr(i).a := r.c.spr(i).data;
         v.d.shreg.spr(i).b := r.c.spr(i).datb;
@@ -518,61 +596,92 @@ begin
 
     -- Generate pixel bus
 
-    for i in 0 to 1 loop
-      if r.c.bplcon.hires = '1' then
-        v.e.bplbus(1-i)(0) := (
+    if r.c.bplcon.shres = '1' and CFG_ECS then
+      -- SHRES: 4 independent pixels per CLK7 cycle.
+      -- Only 4 bitplanes (0-3) are used; bits 4-5 always zero.
+      -- Scroll offset aligned to groups of 4 (AND "1100").
+      for i in 0 to 3 loop
+        v.e.bplbus(3-i)(0) := (
           r.d.bplen(0) and
-          r.d.shreg.bpld(0)(to_integer(unsigned(r.c.bplcon.pf1h and "1110"))+i)
+          r.d.shreg.bpld(0)(to_integer(unsigned(r.c.bplcon.pf1h and "1100"))+i)
         );
-        v.e.bplbus(1-i)(2) := (
+        v.e.bplbus(3-i)(2) := (
           r.d.bplen(2) and
-          r.d.shreg.bpld(2)(to_integer(unsigned(r.c.bplcon.pf1h and "1110"))+i)
+          r.d.shreg.bpld(2)(to_integer(unsigned(r.c.bplcon.pf1h and "1100"))+i)
         );
-        v.e.bplbus(1-i)(4) := '0';
-        v.e.bplbus(1-i)(1) := (
+        v.e.bplbus(3-i)(4) := '0';
+        v.e.bplbus(3-i)(1) := (
           r.d.bplen(1) and
-          r.d.shreg.bpld(1)(to_integer(unsigned(r.c.bplcon.pf2h and "1110"))+i)
+          r.d.shreg.bpld(1)(to_integer(unsigned(r.c.bplcon.pf2h and "1100"))+i)
         );
-        v.e.bplbus(1-i)(3) := (
+        v.e.bplbus(3-i)(3) := (
           r.d.bplen(3) and
-          r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h and "1110"))+i)
+          r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h and "1100"))+i)
         );
-        v.e.bplbus(1-i)(5) := '0';
-        -- mask hires pixels outside combined display window
+        v.e.bplbus(3-i)(5) := '0';
         if r.c.diw = '0' then
-          v.e.bplbus(1-i) := (others => '0');
+          v.e.bplbus(3-i) := (others => '0');
         end if;
-      else
-        v.e.bplbus(i)(0) := (
-          r.d.bplen(0) and
-          r.d.shreg.bpld(0)(to_integer(unsigned(r.c.bplcon.pf1h)))
-        );
-        v.e.bplbus(i)(2) := (
-          r.d.bplen(2) and
-          r.d.shreg.bpld(2)(to_integer(unsigned(r.c.bplcon.pf1h)))
-        );
-        v.e.bplbus(i)(4) := (
-          r.d.bplen(4) and
-          r.d.shreg.bpld(4)(to_integer(unsigned(r.c.bplcon.pf1h)))
-        );
-        v.e.bplbus(i)(1) := (
-          r.d.bplen(1) and
-          r.d.shreg.bpld(1)(to_integer(unsigned(r.c.bplcon.pf2h)))
-        );
-        v.e.bplbus(i)(3) := (
-          r.d.bplen(3) and
-          r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h)))
-        );
-        v.e.bplbus(i)(5) := (
-          r.d.bplen(5) and
-          r.d.shreg.bpld(5)(to_integer(unsigned(r.c.bplcon.pf2h)))
-        );
-        -- mask lores pixels outside combined display window
-        if r.c.diw = '0' then
-          v.e.bplbus(i) := (others => '0');
+      end loop;
+    else
+      for i in 0 to 1 loop
+        if r.c.bplcon.hires = '1' then
+          v.e.bplbus(1-i)(0) := (
+            r.d.bplen(0) and
+            r.d.shreg.bpld(0)(to_integer(unsigned(r.c.bplcon.pf1h and "1110"))+i)
+          );
+          v.e.bplbus(1-i)(2) := (
+            r.d.bplen(2) and
+            r.d.shreg.bpld(2)(to_integer(unsigned(r.c.bplcon.pf1h and "1110"))+i)
+          );
+          v.e.bplbus(1-i)(4) := '0';
+          v.e.bplbus(1-i)(1) := (
+            r.d.bplen(1) and
+            r.d.shreg.bpld(1)(to_integer(unsigned(r.c.bplcon.pf2h and "1110"))+i)
+          );
+          v.e.bplbus(1-i)(3) := (
+            r.d.bplen(3) and
+            r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h and "1110"))+i)
+          );
+          v.e.bplbus(1-i)(5) := '0';
+          if r.c.diw = '0' then
+            v.e.bplbus(1-i) := (others => '0');
+          end if;
+        else
+          v.e.bplbus(i)(0) := (
+            r.d.bplen(0) and
+            r.d.shreg.bpld(0)(to_integer(unsigned(r.c.bplcon.pf1h)))
+          );
+          v.e.bplbus(i)(2) := (
+            r.d.bplen(2) and
+            r.d.shreg.bpld(2)(to_integer(unsigned(r.c.bplcon.pf1h)))
+          );
+          v.e.bplbus(i)(4) := (
+            r.d.bplen(4) and
+            r.d.shreg.bpld(4)(to_integer(unsigned(r.c.bplcon.pf1h)))
+          );
+          v.e.bplbus(i)(1) := (
+            r.d.bplen(1) and
+            r.d.shreg.bpld(1)(to_integer(unsigned(r.c.bplcon.pf2h)))
+          );
+          v.e.bplbus(i)(3) := (
+            r.d.bplen(3) and
+            r.d.shreg.bpld(3)(to_integer(unsigned(r.c.bplcon.pf2h)))
+          );
+          v.e.bplbus(i)(5) := (
+            r.d.bplen(5) and
+            r.d.shreg.bpld(5)(to_integer(unsigned(r.c.bplcon.pf2h)))
+          );
+          if r.c.diw = '0' then
+            v.e.bplbus(i) := (others => '0');
+          end if;
         end if;
-      end if;
-    end loop;
+      end loop;
+      -- Replicate slots 0-1 to slots 2-3 for uniform pipeline processing.
+      -- In lores, all 4 slots are identical. In hires, pairs are duplicated.
+      v.e.bplbus(2) := v.e.bplbus(0);
+      v.e.bplbus(3) := v.e.bplbus(1);
+    end if;
 
     -- Transform 8 individual 2-line sprites into 4 groups of 4-line sprites.
     -- Each group has the same color registers.
@@ -581,7 +690,10 @@ begin
       v.e.sprbus(4*i+2) := r.d.shreg.spr(2*i+1).a(15);
       v.e.sprbus(4*i+1) := r.d.shreg.spr(2*i+0).b(15);
       v.e.sprbus(4*i+0) := r.d.shreg.spr(2*i+0).a(15);
-      if r.c.spr(2*i+1).att = '0' then
+      -- In OCS, only odd sprite ATT bit controls attachment.
+      -- In ECS, either sprite's ATT bit triggers attachment.
+      if (r.c.spr(2*i+1).att = '0') and
+         (r.c.spr(2*i).att = '0' or not CFG_ECS) then
         -- Offset into color register space of this sprite,
         -- but only if there is a pixel.
         v.e.sprbus(4*i+3 downto 4*i+2) := std_ulogic_vector(to_unsigned(i, 2));
@@ -615,7 +727,7 @@ begin
     -- The "pfp" is the selected playfield placement with respect to sprites.
     -- This thing is a bit tricky. Please see the HRM
 
-    for i in 0 to 1 loop
+    for i in 0 to 3 loop
       -- select color and priority for bitplanes
       if r.c.bplcon.pf2pri = '1' then
         -- Playfield 2 shall have priority according to BPLCON.
@@ -679,7 +791,7 @@ begin
 
     -- Prio between any playfield and any sprite.
     v.g.issprite := '0';
-    for i in 0 to 1 loop
+    for i in 0 to 3 loop
       if unsigned(r.f.pfp(i)) <= unsigned(r.f.spp) then
         if r.f.bplcolor(i) = "00000" and r.f.sprcolor /= "0000" then
           v.g.color(i) := '1' & r.f.sprcolor;
@@ -707,7 +819,8 @@ begin
       -- playfield color indices have bit 4 clear (registers 0-15).
       -- Reference: amiga_replacement_project/denise masks only the
       -- bitplane pixel bus with the display window, not sprites.
-      if r.c.diw = '0' then
+      -- Use pipelined DIW (r.f.diw) to stay aligned with pixel data.
+      if r.f.diw = '0' then
         if v.g.color(i)(4) = '0' then
           v.g.color(i) := (others => '0');
         end if;
@@ -717,7 +830,7 @@ begin
 
 
     -- Color lookup
-    for i in 0 to 1 loop
+    for i in 0 to 3 loop
       if isx(r.g.color(i)) then
         v.h.rgb(i) := (others => 'X');
       else
@@ -729,6 +842,7 @@ begin
       if r.c.bplcon.dblpf = '0' then
         if r.c.bplcon.homod = '1' then
           -- Feedback previous RGB output and use current HAM opcode.
+          -- HAM is lores-only, so index 0 is the canonical pixel.
           v.h.rgb(0) := hold_and_modify(
             v.h.rgb(0),
             r.h.rgb(0),
@@ -736,33 +850,50 @@ begin
             r.g.color(0)(3 downto 0)
           );
           v.h.rgb(1) := v.h.rgb(0);
+          v.h.rgb(2) := v.h.rgb(0);
+          v.h.rgb(3) := v.h.rgb(0);
         else
-          -- EHB is a right-shift of looked-up color and no RGB feedback
-          if r.g.hamop(1) = '1' then
+          -- EHB is a right-shift of looked-up color and no RGB feedback.
+          -- EHB is lores-only, so propagate to all 4 slots.
+          if r.g.hamop(1) = '1' and r.c.bplcon.killehb = '0' then
             v.h.rgb(0)(11 downto 8) := '0' & v.h.rgb(0)(11 downto 9);
             v.h.rgb(0)( 7 downto 4) := '0' & v.h.rgb(0)( 7 downto 5);
             v.h.rgb(0)( 3 downto 0) := '0' & v.h.rgb(0)( 3 downto 1);
             v.h.rgb(1) := v.h.rgb(0);
+            v.h.rgb(2) := v.h.rgb(0);
+            v.h.rgb(3) := v.h.rgb(0);
           end if;
         end if;
       end if;
     end if;
 
-    for i in 0 to 1 loop
-      if r.c.hblank = '1' then
+    -- ECS BRDRBLNK: blank border to black when outside display window.
+    -- Use pipelined DIW (r.g.diw) to stay aligned with pixel data.
+    if r.g.diw = '0' and r.c.bplcon.brdrblnk = '1' and CFG_ECS then
+      for i in 0 to 3 loop
+        v.h.rgb(i) := (others => '0');
+      end loop;
+    end if;
+
+    -- Use pipelined HBLANK/VBLANK (r.g.*) so blanking arrives at the
+    -- output at the same time as the pixel data it should gate.
+    -- Without this, blanking was 3-4 CLK7 cycles ahead of pixel data,
+    -- shifting the entire display to the right.
+    for i in 0 to 3 loop
+      if r.g.hblank = '1' then
         v.h.rgb(i) := (others => '0');
       end if;
-      if r.c.vblank = '1' and CFG_BLANK_DURING_VBLANK then
+      if r.g.vblank = '1' and CFG_BLANK_DURING_VBLANK then
         v.h.rgb(i) := (others => '0');
       end if;
     end loop;
 
-    for i in 0 to 1 loop
+    for i in 0 to 3 loop
       v.h.nzd(i) := '1';
       if r.g.color(i) = "00000" then
         v.h.nzd(i) := '0';
       end if;
-      if r.c.vblank = '1' then
+      if r.g.vblank = '1' then
         v.h.nzd(i) := r.c.bplcon.gaud;
       end if;
     end loop;

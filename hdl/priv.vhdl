@@ -56,6 +56,7 @@ package priv is
     strvbl  : std_ulogic; -- 03A S
     strhor  : std_ulogic; -- 03C S
     strlong : std_ulogic; -- 03E S
+    deniseid: std_ulogic; -- 07C R (ECS)
     diwstrt : std_ulogic; -- 08E S
     diwstop : std_ulogic; -- 090 S
     clxcon  : std_ulogic; -- 098 W
@@ -66,6 +67,7 @@ package priv is
     spr     : sel_sprite_array_t(0 to 7); -- 140..17E W
     colorx  : std_ulogic;
     color   : std_ulogic_vector(0 to 31); -- 180..1BE W
+    diwhigh : std_ulogic; -- 1E4 W (ECS)
   end record;
   constant SEL_NONE : sel_t := (
     joy0dat => '0',
@@ -76,6 +78,7 @@ package priv is
     strvbl  => '0',
     strhor  => '0',
     strlong => '0',
+    deniseid=> '0',
     diwstrt => '0',
     diwstop => '0',
     clxcon  => '0',
@@ -85,7 +88,8 @@ package priv is
     bpldat  => (others => '0'),
     spr     => (others => SEL_SPRITE_NONE),
     colorx  => '0',
-    color   => (others => '0')
+    color   => (others => '0'),
+    diwhigh => '0'
   );
 
   -- register address decoder
@@ -136,6 +140,7 @@ package body priv is
       when x"03A" => s.strvbl     := '1';
       when x"03C" => s.strhor     := '1';
       when x"03E" => s.strlong    := '1';
+      when x"07C" => s.deniseid   := '1';
       when x"08E" => s.diwstrt    := '1';
       when x"090" => s.diwstop    := '1';
       when x"100" => s.bplcon0    := '1';
@@ -216,6 +221,7 @@ package body priv is
       when x"1BA" => s.color(29)   := '1';
       when x"1BC" => s.color(30)   := '1';
       when x"1BE" => s.color(31)   := '1';
+      when x"1E4" => s.diwhigh    := '1';
       when others =>
         null;
     end case;

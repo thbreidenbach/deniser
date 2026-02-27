@@ -71,8 +71,8 @@ package ocs is
   type denise_out_t is record
     drd     : std_ulogic_vector(15 downto  0);
     drd_oe  : std_ulogic;
-    rgb     : rgb4_array_t(0 to 1);
-    nzd     : std_ulogic_vector(0 to 1);
+    rgb     : rgb4_array_t(0 to 3);
+    nzd     : std_ulogic_vector(0 to 3);
     nburst  : std_ulogic;
 
     -- external bus driver control

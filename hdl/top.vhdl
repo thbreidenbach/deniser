@@ -63,6 +63,9 @@ architecture rtl of top is
 
 begin
   den0 : entity ocs.denise
+  generic map (
+    CFG_ECS => true
+  )
   port map (
     deni  => deni,
     deno  => deno
@@ -92,6 +95,9 @@ begin
 
   -- All logic is clocked in the clk7 domain which corresponds to lores pixel
   -- resolution. DDR output registers are used to emit hires RGB pixels.
+  -- NOTE: SHRES mode produces 4 pixels per CLK7 in deno.rgb(0..3), but the
+  -- DDR output only uses indices 0 and 1 (hires rate). Full SHRES output
+  -- would require a 2x CLK7 PLL clock (14.3 MHz) feeding the DDR registers.
   vidx : for i in 0 to 3 generate
     r : entity ocs.oddr
     port map (
