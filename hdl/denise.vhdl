@@ -46,6 +46,30 @@ architecture rtl of denise is
   constant NBURST_START_PAL : natural range 0 to 511 := 41;
   constant NBURST_NCLK_PAL  : natural range 0 to 511 := 18;
 
+  -- Pipeline depth note.
+  -- The real Denise chip is mostly combinational (near-zero latency
+  -- from HPOS comparison to RGB output).  Our registered pipeline
+  -- adds latency which shifts the display rightward relative to HSYNC
+  -- (which comes directly from Agnus, bypassing Denise).
+  -- To minimize this, stages F, G and H use combinational feed-forward
+  -- (v.* instead of r.*) so they collapse into the same CLK7 cycle
+  -- as stage E.
+  -- Effective pipeline: C(compare) -> D(shift reg) -> E+F+G+H(output)
+  -- = 2 CLK7 cycles from comparison to output.
+  --
+  -- Sprite HPOS delay.
+  -- The collapsed pipeline reduces sprite-to-output latency compared
+  -- to the original Denise chip.  SPRITE_HPOS_DELAY compensates by
+  -- making the sprite HPOS comparison fire later (each unit = 1 CLK7
+  -- = 2 hires pixels rightward shift).  Combined with using r.c.h
+  -- (pre-increment, +1 CLK7), the total sprite delay is
+  -- SPRITE_HPOS_DELAY + 1 CLK7 beyond the base v.c.h timing.
+  -- Value 3 gives 8 hires pixels total shift (matches ~6 pixel offset
+  -- observed in testing).  Adjust if sprites are still misaligned:
+  --   Too far LEFT  -> increase value
+  --   Too far RIGHT -> decrease value
+  constant SPRITE_HPOS_DELAY : natural := 3;
+
   subtype color_index_t is std_ulogic_vector(4 downto 0);
   type color_index_array_t is array (integer range <>) of color_index_t;
 
@@ -245,6 +269,7 @@ begin
   process (r, deni, joy0daty, joy0datx, joy1daty, joy1datx)
     variable v : state_t;
     variable readreg : boolean;
+    variable spr_target : unsigned(8 downto 0);
   begin
     v := r;
 
@@ -501,23 +526,19 @@ begin
     end if;
 
 
-    -- Pipeline blanking/DIW signals alongside pixel data (stages E→F→G).
-    -- Pixel data enters the pipeline at stage E (v.e.bplbus from r.d).
-    -- HBLANK/VBLANK from stage C (r.c.hblank) also enter at stage E so
-    -- they travel the same number of stages to the output (stage H).
-    -- At cycle N+1: r.c.hblank reflects comparison from cycle N,
-    --               v.e.bplbus uses r.d from cycle N (same source cycle).
-    -- This matches amiga_replacement where cblank_p4 and pf_data_p4
-    -- are at the same pipeline stage.
+    -- Pipeline blanking/DIW signals alongside pixel data.
+    -- Stage E is the pipeline entry point (registered from stage C).
+    -- Stages F, G use combinational feed-forward (v.* not r.*) to
+    -- collapse with stages E+F+G+H into a single CLK7 cycle.
     v.e.hblank := r.c.hblank;
     v.e.vblank := r.c.vblank;
     v.e.diw    := r.c.diw;
-    v.f.hblank := r.e.hblank;
-    v.f.vblank := r.e.vblank;
-    v.f.diw    := r.e.diw;
-    v.g.hblank := r.f.hblank;
-    v.g.vblank := r.f.vblank;
-    v.g.diw    := r.f.diw;
+    v.f.hblank := v.e.hblank;
+    v.f.vblank := v.e.vblank;
+    v.f.diw    := v.e.diw;
+    v.g.hblank := v.f.hblank;
+    v.g.vblank := v.f.vblank;
+    v.g.diw    := v.f.diw;
 
 
     -- parallel to serial converters
@@ -582,11 +603,16 @@ begin
        r.d.shreg.spr(i).a(r.d.shreg.spr(i).a'high - 1 downto 0) & '0';
       v.d.shreg.spr(i).b :=
        r.d.shreg.spr(i).b(r.d.shreg.spr(i).b'high - 1 downto 0) & '0';
-      -- Use v.c.h (post-increment) to match amiga_replacement timing
-      -- where sprite HPOS match happens on cdac_f AFTER cdac_r increment.
+      -- Sprite HPOS match with delay compensation.
+      -- The collapsed pipeline (E+F+G+H combinational) reduces
+      -- sprite-to-output latency vs. the original Denise chip.
+      -- Using r.c.h (pre-increment) adds 1 CLK7 vs v.c.h.
+      -- SPRITE_HPOS_DELAY adds further CLK7 delay by comparing
+      -- r.c.h against (target + DELAY), so match fires later.
+      spr_target := unsigned(r.c.spr(i).sh) + SPRITE_HPOS_DELAY;
       if
         (r.c.spr(i).en = '1') and
-        (std_ulogic_vector(v.c.h) = r.c.spr(i).sh)
+        (r.c.h = spr_target)
       then
         v.d.shreg.spr(i).a := r.c.spr(i).data;
         v.d.shreg.spr(i).b := r.c.spr(i).datb;
@@ -727,35 +753,37 @@ begin
     -- The "pfp" is the selected playfield placement with respect to sprites.
     -- This thing is a bit tricky. Please see the HRM
 
+    -- Stage F uses combinational feed-forward from v.e (not r.e) to
+    -- collapse the pipeline: E+F execute in the same CLK7 cycle.
     for i in 0 to 3 loop
       -- select color and priority for bitplanes
       if r.c.bplcon.pf2pri = '1' then
         -- Playfield 2 shall have priority according to BPLCON.
         -- It means our odd numbered planes have priority over our even planes.
         v.f.bplcolor(i) :=
-         "01" & r.e.bplbus(i)(5) & r.e.bplbus(i)(3) & r.e.bplbus(i)(1);
+         "01" & v.e.bplbus(i)(5) & v.e.bplbus(i)(3) & v.e.bplbus(i)(1);
         v.f.pfp(i) := r.c.bplcon.pf2p;
         if v.f.bplcolor(i) = "01000" then
           -- Playfield 2 says color index 0 so playfield 1 wins.
           v.f.bplcolor(i) :=
-           "00" & r.e.bplbus(i)(4) & r.e.bplbus(i)(2) & r.e.bplbus(i)(0);
+           "00" & v.e.bplbus(i)(4) & v.e.bplbus(i)(2) & v.e.bplbus(i)(0);
           v.f.pfp(i) := r.c.bplcon.pf1p;
         end if;
       else
         -- Playfield 1 shall have priority according to BPLCON.
         v.f.bplcolor(i) :=
-          "00" & r.e.bplbus(i)(4) & r.e.bplbus(i)(2) & r.e.bplbus(i)(0);
+          "00" & v.e.bplbus(i)(4) & v.e.bplbus(i)(2) & v.e.bplbus(i)(0);
         v.f.pfp(i) := r.c.bplcon.pf1p;
         if
           (v.f.bplcolor(i) = "00000") and
-          ((r.e.bplbus(i)(5) or r.e.bplbus(i)(3) or r.e.bplbus(i)(1)) /= '0')
+          ((v.e.bplbus(i)(5) or v.e.bplbus(i)(3) or v.e.bplbus(i)(1)) /= '0')
         then
           -- Playfield 1 says color index 0 so playfield 2 wins.  However, if
           -- playfield 2 also selected its color index 0, then it is
           -- transparent in both playfields. In that case, either the
           -- background color or a sprite shall be visible.
           v.f.bplcolor(i) :=
-           "01" & r.e.bplbus(i)(5) & r.e.bplbus(i)(3) & r.e.bplbus(i)(1);
+           "01" & v.e.bplbus(i)(5) & v.e.bplbus(i)(3) & v.e.bplbus(i)(1);
           v.f.pfp(i) := r.c.bplcon.pf2p;
         end if;
       end if;
@@ -763,7 +791,7 @@ begin
       if r.c.bplcon.dblpf = '0' then
         -- Dual-playfield not enabled so bypass the priority logic above.
         -- TODO: Remember bplbus(5 downto 0) and get rid of r.f.hamop?
-        v.f.bplcolor(i) := r.e.bplbus(i)(4 downto 0);
+        v.f.bplcolor(i) := v.e.bplbus(i)(4 downto 0);
         -- HRM says:
         --   "Be careful: PF2P2 - PF2P0, bits 5-3, are priority bits for
         --   normal (non-dual) playfields."
@@ -771,7 +799,7 @@ begin
       end if;
     end loop;
 
-    v.f.hamop := r.e.bplbus(0)(5 downto 4);
+    v.f.hamop := v.e.bplbus(0)(5 downto 4);
     if r.c.bplcon.dblpf = '0' then
       if r.c.bplcon.homod = '1' then
         v.f.bplcolor(0)(4) := '0';
@@ -779,33 +807,36 @@ begin
     end if;
 
     -- Select color and priority for sprites.
+    -- Uses v.e (combinational) to collapse with stage E.
     v.f.spp := "111";
     v.f.sprcolor := "0000";
     for i in 3 downto 0 loop
-      if r.e.sprbus(4*i+3 downto 4*i) /= "0000" then
-        v.f.sprcolor := r.e.sprbus(4*i+3 downto 4*i);
+      if v.e.sprbus(4*i+3 downto 4*i) /= "0000" then
+        v.f.sprcolor := v.e.sprbus(4*i+3 downto 4*i);
         v.f.spp := std_ulogic_vector(to_unsigned(i, 3));
       end if;
     end loop;
 
 
     -- Prio between any playfield and any sprite.
+    -- Stage G uses combinational feed-forward from v.f (not r.f) to
+    -- collapse the pipeline: E+F+G execute in the same CLK7 cycle.
     v.g.issprite := '0';
     for i in 0 to 3 loop
-      if unsigned(r.f.pfp(i)) <= unsigned(r.f.spp) then
-        if r.f.bplcolor(i) = "00000" and r.f.sprcolor /= "0000" then
-          v.g.color(i) := '1' & r.f.sprcolor;
+      if unsigned(v.f.pfp(i)) <= unsigned(v.f.spp) then
+        if v.f.bplcolor(i) = "00000" and v.f.sprcolor /= "0000" then
+          v.g.color(i) := '1' & v.f.sprcolor;
           if i = 0 then
             v.g.issprite := '1';
           end if;
         else
-          v.g.color(i) := r.f.bplcolor(i);
+          v.g.color(i) := v.f.bplcolor(i);
         end if;
       else
-        if r.f.sprcolor = "0000" then
-          v.g.color(i) := r.f.bplcolor(i);
+        if v.f.sprcolor = "0000" then
+          v.g.color(i) := v.f.bplcolor(i);
         else
-          v.g.color(i) := '1' & r.f.sprcolor;
+          v.g.color(i) := '1' & v.f.sprcolor;
           if i = 0 then
             v.g.issprite := '1';
           end if;
@@ -813,32 +844,29 @@ begin
       end if;
 
       -- Outside the display window: show border color (COLOR00) for
-      -- playfield pixels, but keep sprite colors visible. In real Amiga
-      -- Denise, sprites are drawn independently of the display window.
-      -- Sprite color indices have bit 4 set (registers 16-31), while
-      -- playfield color indices have bit 4 clear (registers 0-15).
-      -- Reference: amiga_replacement_project/denise masks only the
-      -- bitplane pixel bus with the display window, not sprites.
-      -- Use pipelined DIW (r.f.diw) to stay aligned with pixel data.
-      if r.f.diw = '0' then
+      -- playfield pixels, but keep sprite colors visible.
+      -- Uses v.f.diw (combinational) for collapsed pipeline.
+      if v.f.diw = '0' then
         if v.g.color(i)(4) = '0' then
           v.g.color(i) := (others => '0');
         end if;
       end if;
     end loop;
-    v.g.hamop := r.f.hamop;
+    v.g.hamop := v.f.hamop;
 
 
-    -- Color lookup
+    -- Color lookup.
+    -- Stage H uses combinational feed-forward from v.g (not r.g) to
+    -- collapse the pipeline: E+F+G+H execute in the same CLK7 cycle.
     for i in 0 to 3 loop
-      if isx(r.g.color(i)) then
+      if isx(v.g.color(i)) then
         v.h.rgb(i) := (others => 'X');
       else
-        v.h.rgb(i) := r.c.color(to_integer(unsigned(r.g.color(i))));
+        v.h.rgb(i) := r.c.color(to_integer(unsigned(v.g.color(i))));
       end if;
     end loop;
 
-    if r.g.issprite = '0' and (true or r.c.bplcon.hires = '0') then
+    if v.g.issprite = '0' and (true or r.c.bplcon.hires = '0') then
       if r.c.bplcon.dblpf = '0' then
         if r.c.bplcon.homod = '1' then
           -- Feedback previous RGB output and use current HAM opcode.
@@ -846,8 +874,8 @@ begin
           v.h.rgb(0) := hold_and_modify(
             v.h.rgb(0),
             r.h.rgb(0),
-            r.g.hamop,
-            r.g.color(0)(3 downto 0)
+            v.g.hamop,
+            v.g.color(0)(3 downto 0)
           );
           v.h.rgb(1) := v.h.rgb(0);
           v.h.rgb(2) := v.h.rgb(0);
@@ -855,7 +883,7 @@ begin
         else
           -- EHB is a right-shift of looked-up color and no RGB feedback.
           -- EHB is lores-only, so propagate to all 4 slots.
-          if r.g.hamop(1) = '1' and r.c.bplcon.killehb = '0' then
+          if v.g.hamop(1) = '1' and r.c.bplcon.killehb = '0' then
             v.h.rgb(0)(11 downto 8) := '0' & v.h.rgb(0)(11 downto 9);
             v.h.rgb(0)( 7 downto 4) := '0' & v.h.rgb(0)( 7 downto 5);
             v.h.rgb(0)( 3 downto 0) := '0' & v.h.rgb(0)( 3 downto 1);
@@ -868,32 +896,30 @@ begin
     end if;
 
     -- ECS BRDRBLNK: blank border to black when outside display window.
-    -- Use pipelined DIW (r.g.diw) to stay aligned with pixel data.
-    if r.g.diw = '0' and r.c.bplcon.brdrblnk = '1' and CFG_ECS then
+    -- Uses v.g.diw (combinational) for collapsed pipeline.
+    if v.g.diw = '0' and r.c.bplcon.brdrblnk = '1' and CFG_ECS then
       for i in 0 to 3 loop
         v.h.rgb(i) := (others => '0');
       end loop;
     end if;
 
-    -- Use pipelined HBLANK/VBLANK (r.g.*) so blanking arrives at the
-    -- output at the same time as the pixel data it should gate.
-    -- Without this, blanking was 3-4 CLK7 cycles ahead of pixel data,
-    -- shifting the entire display to the right.
+    -- Blanking: uses v.g.hblank/vblank (combinational feed-forward
+    -- from r.c.hblank/vblank via v.e → v.f → v.g).
     for i in 0 to 3 loop
-      if r.g.hblank = '1' then
+      if v.g.hblank = '1' then
         v.h.rgb(i) := (others => '0');
       end if;
-      if r.g.vblank = '1' and CFG_BLANK_DURING_VBLANK then
+      if v.g.vblank = '1' and CFG_BLANK_DURING_VBLANK then
         v.h.rgb(i) := (others => '0');
       end if;
     end loop;
 
     for i in 0 to 3 loop
       v.h.nzd(i) := '1';
-      if r.g.color(i) = "00000" then
+      if v.g.color(i) = "00000" then
         v.h.nzd(i) := '0';
       end if;
-      if r.g.vblank = '1' then
+      if v.g.vblank = '1' then
         v.h.nzd(i) := r.c.bplcon.gaud;
       end if;
     end loop;

@@ -18,7 +18,7 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
-library ocs;
+library work;
 
 -- Technology-independent top level
 entity top is
@@ -62,7 +62,7 @@ architecture rtl of top is
   signal deno       : work.ocs.denise_out_t;
 
 begin
-  den0 : entity ocs.denise
+  den0 : entity work.denise
   generic map (
     CFG_ECS => true
   )
@@ -99,7 +99,7 @@ begin
   -- DDR output only uses indices 0 and 1 (hires rate). Full SHRES output
   -- would require a 2x CLK7 PLL clock (14.3 MHz) feeding the DDR registers.
   vidx : for i in 0 to 3 generate
-    r : entity ocs.oddr
+    r : entity work.oddr
     port map (
       d0  => deno.rgb(0)(8+i),
       d1  => deno.rgb(1)(8+i),
@@ -107,7 +107,7 @@ begin
       q   => video_r(i)
     );
 
-    g : entity ocs.oddr
+    g : entity work.oddr
     port map (
       d0  => deno.rgb(0)(4+i),
       d1  => deno.rgb(1)(4+i),
@@ -115,7 +115,7 @@ begin
       q   => video_g(i)
     );
 
-    b : entity ocs.oddr
+    b : entity work.oddr
     port map (
       d0  => deno.rgb(0)(0+i),
       d1  => deno.rgb(1)(0+i),
@@ -124,7 +124,7 @@ begin
     );
   end generate;
 
-  vidnzd : entity ocs.oddr
+  vidnzd : entity work.oddr
   port map (
     d0  => deno.nzd(0),
     d1  => deno.nzd(1),
